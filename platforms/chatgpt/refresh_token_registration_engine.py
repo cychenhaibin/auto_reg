@@ -19,7 +19,7 @@ from curl_cffi import requests as cffi_requests
 from core.task_runtime import TaskInterruption
 from .oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient
-from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_browser import get_sentinel_token_via_browser, submit_password_via_browser
 from .sentinel_token import build_sentinel_token
 from .utils import (
     generate_datadog_trace,
@@ -149,6 +149,7 @@ class RefreshTokenRegistrationEngine:
         self._token_acquisition_requires_login: bool = False  # 新注册账号需要二次登录拿 token
         self._post_otp_continue_url: str = ""
         self._post_otp_page_type: str = ""
+        self._signup_response_data: Optional[Dict[str, Any]] = None  # signup 表单返回的完整响应数据
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -256,9 +257,28 @@ class RefreshTokenRegistrationEngine:
 
                 seed_oai_device_cookie(self.session, self._device_id)
 
+                # 使用浏览器导航请求头访问 OAuth 页面（模拟真实浏览器）
+                nav_headers = {
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "accept-language": "en-US,en;q=0.9",
+                    "accept-encoding": "gzip, deflate, br",
+                    "user-agent": self._default_user_agent(),
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "cross-site",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                    "sec-ch-ua": '"Not/A)Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "cache-control": "max-age=0",
+                    "dnt": "1",
+                }
+
                 response = self.session.get(
                     self.oauth_start.auth_url,
-                    timeout=20
+                    headers=nav_headers,
+                    timeout=30
                 )
 
                 if response.status_code < 400:
@@ -796,10 +816,11 @@ class RefreshTokenRegistrationEngine:
     def _register_password(self) -> Tuple[bool, Optional[str]]:
         """注册密码"""
         try:
-            # 生成密码
+            # 生成密码和用户信息
             password = self._generate_password()
             self.password = password  # 保存密码到实例变量
-            self._log(f"生成密码: {password}")
+            user_info = generate_random_user_info()
+            self._log(f"生成密码: {password}, 用户名: {user_info['name']}")
 
             # 先访问注册页面获取 Cloudflare Cookie
             self._log("提交密码前：先访问页面获取 Cloudflare Cookie...")
@@ -817,52 +838,50 @@ class RefreshTokenRegistrationEngine:
             except Exception as page_err:
                 self._log(f"提交密码前：页面访问异常（继续尝试）: {page_err}")
 
-            # 提交密码注册
-            register_body = json.dumps({
-                "password": password,
-                "username": self.email
-            })
-
-            headers = self._build_json_headers(
-                referer="https://auth.openai.com/create-account/password",
-                include_device_id=True,
-                include_datadog=True,
-            )
+            # 获取 Sentinel token（浏览器优先，失败则回退到 HTTP session 方式）
             sen_token = self._check_sentinel(
                 self._device_id or "",
                 flow="username_password_create",
             )
-            if sen_token:
-                headers["openai-sentinel-token"] = sen_token
+            if not sen_token:
+                self._log("Sentinel token 获取失败，无法提交密码", "error")
+                return False, None
 
-            # 提交前添加自然延迟
-            time.sleep(random.uniform(1.0, 2.5))
-
-            response = self.session.post(
-                OPENAI_API_ENDPOINTS["register"],
-                headers=headers,
-                data=register_body,
+            # 用浏览器直接提交密码（同一浏览器的 Cookie 匹配，不会触发 Cloudflare 检测）
+            self._log("提交密码（浏览器直连）...")
+            
+            import os
+            has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            force_headless = not has_display
+            
+            submit_result = submit_password_via_browser(
+                email=self.email,
+                password=password,
+                sentinel_token=sen_token,
+                device_id=self._device_id or "",
+                proxy=self.proxy_url,
+                headless=force_headless,
+                log_fn=lambda msg: self._log(msg),
             )
 
-            self._log(f"提交密码状态: {response.status_code}")
+            status_code = submit_result.get("status_code", 0)
+            self._log(f"提交密码状态: {status_code}")
 
-            if response.status_code != 200:
-                error_text = response.text[:500]
+            if not submit_result.get("success"):
+                body = submit_result.get("body", "")
+                if isinstance(body, dict):
+                    error_text = json.dumps(body, ensure_ascii=False)[:500]
+                else:
+                    error_text = str(body)[:500]
                 self._log(f"密码注册失败: {error_text}", "warning")
 
                 # 解析错误信息，判断是否是邮箱已注册
-                try:
-                    error_json = response.json()
-                    error_msg = error_json.get("error", {}).get("message", "")
-                    error_code = error_json.get("error", {}).get("code", "")
-
-                    # 检测邮箱已注册的情况
+                if isinstance(body, dict):
+                    error_msg = body.get("error", {}).get("message", "")
+                    error_code = body.get("error", {}).get("code", "")
                     if "already" in error_msg.lower() or "exists" in error_msg.lower() or error_code == "user_exists":
                         self._log(f"邮箱 {self.email} 可能已在 OpenAI 注册过", "error")
-                        # 标记此邮箱为已注册状态
                         self._mark_email_as_registered()
-                except Exception:
-                    pass
 
                 return False, None
 
@@ -1766,6 +1785,11 @@ class RefreshTokenRegistrationEngine:
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
                 return result
+
+            # 保存 signup 响应数据，后续密码提交时需要其中的 token
+            self._signup_response_data = signup_result.response_data or {}
+            if self._signup_response_data:
+                self._log(f"Signup 响应数据: {json.dumps(self._signup_response_data)[:300]}")
 
             if self._is_existing_account:
                 self._log("检测到该邮箱已注册，切换到登录流程获取 Token")
