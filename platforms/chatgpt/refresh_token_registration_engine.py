@@ -853,13 +853,10 @@ class RefreshTokenRegistrationEngine:
             
             auth_cookies = {}
             if self.session:
-                # 提取所有 auth.openai.com 域下的 cookie
+                # 只同步认证相关的 cookie（Cloudflare 的 __cf_bm/cf_clearance 浏览器访问页面时自动获得）
                 session_cookie_names = [
                     "__Host-authjs.session-token",
-                    "oai-client-auth-session", 
-                    "cf_clearance",
-                    "__cf_bm",
-                    "__cflb",
+                    "oai-client-auth-session",
                 ]
                 for name in session_cookie_names:
                     val = self.session.cookies.get(name)

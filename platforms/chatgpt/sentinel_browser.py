@@ -250,6 +250,7 @@ def submit_password_via_browser(
                                 "name": cookie_name,
                                 "value": str(cookie_value),
                                 "url": "https://auth.openai.com/",
+                                "domain": ".auth.openai.com",
                                 "path": "/",
                                 "secure": True,
                                 "sameSite": "Lax",
