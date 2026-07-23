@@ -898,16 +898,13 @@ class RefreshTokenRegistrationEngine:
                 self._log(f"密码注册成功！返回状态: {submit_result.get('status_code')}")
                 return True, password
 
-            # 浏览器方式不成功（可能是 session 不匹配），回退到 HTTP session 提交
+            # 浏览器方式不成功（session 不匹配），回退到 HTTP session 提交
             self._log("浏览器提交失败，回退到 HTTP session 提交密码...")
             register_url = OPENAI_API_ENDPOINTS.get("register", "https://auth.openai.com/api/accounts/user/register")
-            headers = self._build_navigation_headers(
+            headers = self._build_json_headers(
                 referer="https://auth.openai.com/create-account/password",
-                accept="application/json",
             )
             headers["openai-sentinel-token"] = sen_token
-            headers["Content-Type"] = "application/json"
-            headers["Origin"] = "https://auth.openai.com"
 
             body_data = {"password": password, "username": self.email}
             self._log(f"HTTP session 提交密码: {json.dumps(body_data)[:200]}, 已有session cookie: {bool(self.session.cookies.get('__Host-authjs.session-token'))}")
