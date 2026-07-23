@@ -880,28 +880,78 @@ class RefreshTokenRegistrationEngine:
                 auth_cookies=auth_cookies if auth_cookies else None,
             )
 
-            status_code = submit_result.get("status_code", 0)
-            self._log(f"提交密码状态: {status_code}")
-
             if not submit_result.get("success"):
                 body = submit_result.get("body", "")
-                if isinstance(body, dict):
-                    error_text = json.dumps(body, ensure_ascii=False)[:500]
+                is_cf_block = (
+                    isinstance(body, str)
+                    and ("Just a moment" in body or "challenges.cloudflare.com" in body)
+                )
+                if is_cf_block:
+                    # 浏览器也被 Cloudflare 拦截了，说明当前 IP 环境有问题
+                    self._log(f"密码注册失败（浏览器 Cloudflare 拦截）: {str(body)[:300]}", "warning")
                 else:
-                    error_text = str(body)[:500]
-                self._log(f"密码注册失败: {error_text}", "warning")
+                    if isinstance(body, dict):
+                        self._log(f"密码注册失败: {json.dumps(body, ensure_ascii=False)[:500]}", "warning")
+                    else:
+                        self._log(f"密码注册失败: {str(body)[:500]}", "warning")
+            else:
+                self._log(f"密码注册成功！返回状态: {submit_result.get('status_code')}")
+                return True, password
 
-                # 解析错误信息，判断是否是邮箱已注册
-                if isinstance(body, dict):
-                    error_msg = body.get("error", {}).get("message", "")
-                    error_code = body.get("error", {}).get("code", "")
-                    if "already" in error_msg.lower() or "exists" in error_msg.lower() or error_code == "user_exists":
-                        self._log(f"邮箱 {self.email} 可能已在 OpenAI 注册过", "error")
-                        self._mark_email_as_registered()
+            # 浏览器方式不成功（可能是 session 不匹配），回退到 HTTP session 提交
+            self._log("浏览器提交失败，回退到 HTTP session 提交密码...")
+            register_url = OPENAI_API_ENDPOINTS.get("register", "https://auth.openai.com/api/accounts/user/register")
+            headers = self._build_navigation_headers(
+                referer="https://auth.openai.com/create-account/password",
+                accept="application/json",
+            )
+            headers["openai-sentinel-token"] = sen_token
+            headers["Content-Type"] = "application/json"
+            headers["Origin"] = "https://auth.openai.com"
 
-                return False, None
+            body_data = {"password": password, "username": self.email}
+            self._log(f"HTTP session 提交密码: {json.dumps(body_data)[:200]}, 已有session cookie: {bool(self.session.cookies.get('__Host-authjs.session-token'))}")
 
-            return True, password
+            for h_attempt in range(3):
+                if h_attempt > 0:
+                    self._log(f"HTTP 密码提交重试 {h_attempt}...")
+                    time.sleep(random.uniform(2, 4))
+                try:
+                    resp = self.session.post(
+                        register_url,
+                        json=body_data,
+                        headers=headers,
+                        timeout=30,
+                    )
+                    h_status = resp.status_code
+                    try:
+                        h_body = resp.json()
+                    except Exception:
+                        h_body = resp.text
+                    self._log(f"HTTP 密码提交: 状态={h_status}")
+
+                    # 检查 Cloudflare
+                    h_body_str = str(h_body)[:500] if not isinstance(h_body, dict) else ""
+                    if "Just a moment" in h_body_str or "challenges.cloudflare.com" in h_body_str:
+                        self._log(f"HTTP 也被 Cloudflare 拦截，等{2+h_attempt}秒重试...", "warning")
+                        continue
+
+                    if 200 <= h_status < 400:
+                        self._log(f"HTTP 密码注册成功！")
+                        return True, password
+                    else:
+                        if isinstance(h_body, dict):
+                            self._log(f"HTTP 密码注册失败: {json.dumps(h_body, ensure_ascii=False)[:500]}", "warning")
+                        else:
+                            self._log(f"HTTP 密码注册失败: {h_body_str[:500]}", "warning")
+                    break  # 非 Cloudflare 错误，不重试
+                except Exception as http_err:
+                    self._log(f"HTTP 密码提交异常: {http_err}", "warning")
+                    continue
+
+            # 浏览器和 HTTP 两种方式都失败
+            self._log("密码注册失败: 浏览器和 HTTP 方式均未成功", "error")
+            return False, None
 
         except Exception as e:
             self._log(f"密码注册失败: {e}", "error")
