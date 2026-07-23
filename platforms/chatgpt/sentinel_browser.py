@@ -277,7 +277,9 @@ def submit_password_via_browser(
             # 再多等一会让 JS 初始化
             page.wait_for_timeout(2000)
 
-            # 3. 提交密码表单（带重试，处理 Cloudflare 拦截 fetch 的情况）
+            # 3. 提交密码表单
+            # 关键：不用 page.evaluate() 里的 fetch()，因为 Cloudflare 的 service worker 会拦截 JS 层的 fetch。
+            # 改用 Playwright 的 context.request，它走浏览器原生网络栈，和页面共享 Cookie，Cloudflare 不拦截。
             body = {
                 "password": password,
                 "username": email,
@@ -289,50 +291,35 @@ def submit_password_via_browser(
                     logger(f"Browser 密码提交: 重试第 {attempt} 次...")
                     page.wait_for_timeout(3000)
 
-                response = page.evaluate(
-                    """
-                    async ({ url, body, sentinel_token }) => {
-                        try {
-                            const resp = await fetch(url, {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Accept': 'application/json',
-                                    'openai-sentinel-token': sentinel_token,
-                                    'Origin': 'https://auth.openai.com',
-                                    'Referer': 'https://auth.openai.com/create-account/password',
-                                },
-                                body: JSON.stringify(body),
-                            });
-                            const text = await resp.text();
-                            let json = null;
-                            try { json = JSON.parse(text); } catch(e) {}
-                            return {
-                                status: resp.status,
-                                body: json || text,
-                            };
-                        } catch (e) {
-                            return {
-                                status: 0,
-                                body: (e && (e.message || String(e))) || 'unknown error',
-                            };
-                        }
-                    }
-                    """,
-                    {"url": register_url, "body": body, "sentinel_token": sentinel_token},
-                )
+                try:
+                    api_resp = context.request.post(
+                        register_url,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                            "openai-sentinel-token": sentinel_token,
+                            "Origin": "https://auth.openai.com",
+                            "Referer": "https://auth.openai.com/create-account/password",
+                        },
+                        data=json.dumps(body),
+                    )
+                    status = api_resp.status
+                    try:
+                        body_data = api_resp.json()
+                    except Exception:
+                        body_data = api_resp.text()
+                except Exception as fetch_err:
+                    status = 0
+                    body_data = str(fetch_err)
 
-                status = response.get("status", 0)
-                body_data = response.get("body", "")
-                
                 # 检查是否是 Cloudflare 拦截
-                body_str = str(body_data)[:200] if not isinstance(body_data, dict) else ""
+                body_str = str(body_data)[:300] if not isinstance(body_data, dict) else ""
                 is_cf_block = (
                     "Just a moment" in body_str
                     or "challenges.cloudflare.com" in body_str
                     or "cf-challenge" in body_str
                 )
-                
+
                 if not is_cf_block:
                     logger(f"Browser 密码提交: 状态={status}")
                     return {
@@ -340,8 +327,8 @@ def submit_password_via_browser(
                         "body": body_data,
                         "success": 200 <= status < 400,
                     }
-                
-                logger(f"Browser 密码提交: fetch 被 Cloudflare 拦截，等待后重试...")
+
+                logger(f"Browser 密码提交: 请求被 Cloudflare 拦截，等待后重试...")
 
             # 所有重试都失败了
             logger("Browser 密码提交: 所有重试均被 Cloudflare 拦截")
