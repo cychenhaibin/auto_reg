@@ -175,10 +175,15 @@ def submit_password_via_browser(
     timeout_ms: int = 45000,
     headless: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
+    auth_cookies: Optional[dict] = None,
 ) -> dict:
     """在真实浏览器中提交注册密码，返回 OpenAI 响应 JSON。
     
     完全绕过 curl_cffi，避免 Cloudflare Session 不匹配问题。
+    
+    Args:
+        auth_cookies: 从 HTTP session 继承的认证 Cookie（如 __Host-authjs.session-token），
+                      传入 dict {cookie_name: cookie_value}，会在浏览器上下文中设置。
     
     Returns:
         {"status_code": int, "body": dict|str, "success": bool}
@@ -235,6 +240,23 @@ def submit_password_via_browser(
                     }])
                 except Exception:
                     pass
+
+            # 从 HTTP session 同步认证 Cookie 到浏览器（关键：保持 session 连续性）
+            if auth_cookies:
+                for cookie_name, cookie_value in auth_cookies.items():
+                    if cookie_value:
+                        try:
+                            context.add_cookies([{
+                                "name": cookie_name,
+                                "value": str(cookie_value),
+                                "url": "https://auth.openai.com/",
+                                "path": "/",
+                                "secure": True,
+                                "sameSite": "Lax",
+                            }])
+                        except Exception:
+                            pass
+                logger(f"Browser 密码提交: 已同步 {len(auth_cookies)} 个认证 Cookie")
 
             page = context.new_page()
 

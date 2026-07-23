@@ -847,8 +847,26 @@ class RefreshTokenRegistrationEngine:
                 self._log("Sentinel token 获取失败，无法提交密码", "error")
                 return False, None
 
-            # 用浏览器直接提交密码（同一浏览器的 Cookie 匹配，不会触发 Cloudflare 检测）
+            # 用浏览器直接提交密码
+            # 关键：把 HTTP session 的认证 Cookie 同步到浏览器，否则 OpenAI 会报 "session no longer valid"
             self._log("提交密码（浏览器直连）...")
+            
+            auth_cookies = {}
+            if self.session:
+                # 提取所有 auth.openai.com 域下的 cookie
+                session_cookie_names = [
+                    "__Host-authjs.session-token",
+                    "oai-client-auth-session", 
+                    "cf_clearance",
+                    "__cf_bm",
+                    "__cflb",
+                ]
+                for name in session_cookie_names:
+                    val = self.session.cookies.get(name)
+                    if val:
+                        auth_cookies[name] = val
+                if auth_cookies:
+                    self._log(f"从 HTTP session 同步 {len(auth_cookies)} 个认证 Cookie: {list(auth_cookies.keys())}")
             
             import os
             has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -862,6 +880,7 @@ class RefreshTokenRegistrationEngine:
                 proxy=self.proxy_url,
                 headless=force_headless,
                 log_fn=lambda msg: self._log(msg),
+                auth_cookies=auth_cookies if auth_cookies else None,
             )
 
             status_code = submit_result.get("status_code", 0)
