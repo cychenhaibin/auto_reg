@@ -176,6 +176,7 @@ def submit_password_via_browser(
     headless: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
     auth_cookies: Optional[dict] = None,
+    signup_csrf: Optional[str] = None,
 ) -> dict:
     """在真实浏览器中提交注册密码，返回 OpenAI 响应 JSON。
     
@@ -184,6 +185,7 @@ def submit_password_via_browser(
     Args:
         auth_cookies: 从 HTTP session 继承的认证 Cookie（如 __Host-authjs.session-token），
                       传入 dict {cookie_name: cookie_value}，会在浏览器上下文中设置。
+        signup_csrf: signup 阶段获取的 csrf token，将添加到注册请求 body 中。
     
     Returns:
         {"status_code": int, "body": dict|str, "success": bool}
@@ -307,7 +309,11 @@ def submit_password_via_browser(
                 "password": password,
                 "username": email,
             }
+            if signup_csrf:
+                body["csrf"] = signup_csrf
+                logger(f"Browser 密码提交: 携带 signup csrf token")
             logger(f"Browser 密码提交: 发送注册请求 {json.dumps(body)[:200]}")
+
 
             for attempt in range(3):
                 if attempt > 0:

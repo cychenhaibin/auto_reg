@@ -150,6 +150,8 @@ class RefreshTokenRegistrationEngine:
         self._post_otp_continue_url: str = ""
         self._post_otp_page_type: str = ""
         self._signup_response_data: Optional[Dict[str, Any]] = None  # signup 表单返回的完整响应数据
+        self._signup_continue_url: str = ""  # signup 返回的 continue_url，用于后续建立 session
+        self._signup_csrf: str = ""  # signup 返回的 csrf token
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -467,6 +469,13 @@ class RefreshTokenRegistrationEngine:
 
             self._log(f"{log_label}状态: {response.status_code}")
 
+            # 记录响应 cookies，帮助调试 session 建立问题
+            response_cookies = dict(response.cookies.items()) if hasattr(response, 'cookies') else {}
+            if response_cookies:
+                self._log(f"Signup 响应 cookies: {list(response_cookies.keys())}")
+            else:
+                self._log(f"Signup 响应 cookies: 无")
+
             if response.status_code != 200:
                 return SignupFormResult(
                     success=False,
@@ -478,6 +487,18 @@ class RefreshTokenRegistrationEngine:
                 response_data = response.json()
                 page_type = response_data.get("page", {}).get("type", "")
                 self._log(f"响应页面类型: {page_type}")
+
+                # 保存 continue_url 用于后续密码提交时建立 session
+                continue_url = response_data.get("continue_url")
+                if continue_url:
+                    self._signup_continue_url = continue_url
+                    self._log(f"保存 signup continue_url: {continue_url[:100]}")
+
+                # 保存 csrf token（如果有）
+                csrf_token = response_data.get("csrf")
+                if csrf_token:
+                    self._signup_csrf = csrf_token
+                    self._log(f"保存 signup csrf token")
 
                 is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
 
@@ -838,6 +859,57 @@ class RefreshTokenRegistrationEngine:
             except Exception as page_err:
                 self._log(f"提交密码前：页面访问异常（继续尝试）: {page_err}")
 
+            # ---- 核心修复: 如果缺少 __Host-authjs.session-token cookie，通过 continue_url 建立 session ----
+            if self.session and not self.session.cookies.get("__Host-authjs.session-token"):
+                self._log("检测到缺少 __Host-authjs.session-token cookie，尝试建立 session...")
+                
+                # 策略1: 使用 signup 返回的 continue_url 访问以建立 session
+                if self._signup_continue_url:
+                    self._log(f"通过 signup continue_url 建立 session: {self._signup_continue_url[:100]}")
+                    try:
+                        cont_headers = self._build_navigation_headers(referer="https://auth.openai.com/create-account")
+                        cont_resp = self.session.get(
+                            self._signup_continue_url,
+                            headers=cont_headers,
+                            allow_redirects=True,
+                            timeout=20,
+                        )
+                        self._log(f"continue_url 访问状态: {cont_resp.status_code}")
+                        session_cookie = self.session.cookies.get("__Host-authjs.session-token")
+                        if session_cookie:
+                            self._log("成功建立 __Host-authjs.session-token!")
+                        else:
+                            self._log("continue_url 访问后仍未获取到 session cookie")
+                        time.sleep(random.uniform(1.0, 2.0))
+                    except Exception as cont_err:
+                        self._log(f"continue_url 访问异常: {cont_err}")
+                
+                # 策略2: 再次访问密码页面，有时第二次访问能建立 session
+                if not self.session.cookies.get("__Host-authjs.session-token"):
+                    self._log("策略2: 再次访问密码页面尝试建立 session...")
+                    try:
+                        page_url2 = "https://auth.openai.com/create-account/password"
+                        nav_headers2 = self._build_navigation_headers(referer="https://auth.openai.com/create-account")
+                        page_resp2 = self.session.get(
+                            page_url2,
+                            headers=nav_headers2,
+                            allow_redirects=True,
+                            timeout=15,
+                        )
+                        self._log(f"二次密码页访问状态: {page_resp2.status_code}")
+                        session_cookie = self.session.cookies.get("__Host-authjs.session-token")
+                        if session_cookie:
+                            self._log("二次访问后成功建立 session cookie!")
+                        time.sleep(random.uniform(1.0, 2.0))
+                    except Exception:
+                        pass
+                
+                # 最终检查 session cookie 状态
+                has_session = bool(self.session.cookies.get("__Host-authjs.session-token"))
+                self._log(f"建立 session 后检查: __Host-authjs.session-token = {has_session}")
+                if not has_session:
+                    self._log("警告: 所有策略均未能获取 session cookie，尝试无 session 模式提交", "warning")
+
             # 获取 Sentinel token（浏览器优先，失败则回退到 HTTP session 方式）
             sen_token = self._check_sentinel(
                 self._device_id or "",
@@ -878,6 +950,7 @@ class RefreshTokenRegistrationEngine:
                 headless=force_headless,
                 log_fn=lambda msg: self._log(msg),
                 auth_cookies=auth_cookies if auth_cookies else None,
+                signup_csrf=self._signup_csrf if self._signup_csrf else None,
             )
 
             if not submit_result.get("success"):
@@ -907,7 +980,14 @@ class RefreshTokenRegistrationEngine:
             headers["openai-sentinel-token"] = sen_token
 
             body_data = {"password": password, "username": self.email}
-            self._log(f"HTTP session 提交密码: {json.dumps(body_data)[:200]}, 已有session cookie: {bool(self.session.cookies.get('__Host-authjs.session-token'))}")
+            
+            # 如果 signup 返回了 csrf token，添加到请求 body
+            if self._signup_csrf:
+                body_data["csrf"] = self._signup_csrf
+                self._log(f"HTTP 密码提交携带 signup csrf token")
+            
+            has_session_cookie = bool(self.session.cookies.get("__Host-authjs.session-token"))
+            self._log(f"HTTP session 提交密码: {json.dumps(body_data)[:200]}, 已有session cookie: {has_session_cookie}")
 
             for h_attempt in range(3):
                 if h_attempt > 0:
